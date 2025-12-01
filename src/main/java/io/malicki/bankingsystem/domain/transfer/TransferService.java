@@ -8,6 +8,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.UUID;
 
+import static io.malicki.bankingsystem.kafka.config.KafkaTopicsConfig.TRANSFER_VALIDATION_TOPIC;
+
 @Service
 @Slf4j
 public class TransferService {
@@ -52,7 +54,7 @@ public class TransferService {
         outboxService.saveOutboxEvent(
                 saved.getTransferId(),
                 "TransferCreated",
-                "transfer-validation",
+                TRANSFER_VALIDATION_TOPIC,
                 saved.getFromAccountNumber(),
                 event
         );
