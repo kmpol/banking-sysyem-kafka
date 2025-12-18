@@ -1,6 +1,6 @@
 # Transfer Flow Diagram
 
-## Główny przepływ transferu (Happy Path)
+## Main Transfer Flow (Happy Path)
 
 ```mermaid
 flowchart TD
@@ -9,17 +9,17 @@ flowchart TD
     end
 
     subgraph TransferService
-        B[Generuj UUID transferId]
-        C[Utwórz Transfer<br/>status: PENDING]
-        D[Zapisz do DB]
-        E[Zapisz do Outbox<br/>destination: transfer-validation]
+        B[Generate UUID transferId]
+        C[Create Transfer<br/>status: PENDING]
+        D[Save to DB]
+        E[Save to Outbox<br/>destination: transfer-validation]
         F[Return 201 Created]
     end
 
     subgraph OutboxProcessor
-        G[Pobierz nieprzetworzony event]
-        H[Wyślij do Kafka]
-        I[Oznacz jako processed=true]
+        G[Fetch unprocessed event]
+        H[Send to Kafka]
+        I[Mark as processed=true]
     end
 
     subgraph Kafka Topics
@@ -29,61 +29,61 @@ flowchart TD
     end
 
     subgraph ValidationConsumer
-        V1[Odbierz wiadomość]
-        V2{Status już<br/>VALIDATED?}
-        V3[Sprawdź czy konta istnieją]
-        V4[Sprawdź czy aktywne]
-        V5[Sprawdź saldo]
+        V1[Receive message]
+        V2{Status already<br/>VALIDATED?}
+        V3[Check accounts exist]
+        V4[Check accounts active]
+        V5[Check balance]
         V6[Status: VALIDATED]
-        V7[Zapisz do Outbox<br/>destination: transfer-execution]
+        V7[Save to Outbox<br/>destination: transfer-execution]
         V8[ACK]
     end
 
     subgraph ExecutionConsumer
-        E1[Odbierz wiadomość]
-        E2{Status już<br/>COMPLETED?}
-        E3[SELECT FOR UPDATE<br/>na kontach]
+        E1[Receive message]
+        E2{Status already<br/>COMPLETED?}
+        E3[SELECT FOR UPDATE<br/>lock accounts]
         E4[fromAccount.withdraw]
         E5[toAccount.deposit]
         E6[Status: COMPLETED]
-        E7[Zapisz do Outbox<br/>destination: transfer-completed]
+        E7[Save to Outbox<br/>destination: transfer-completed]
         E8[ACK + Release locks]
     end
 
     subgraph NotificationConsumer
-        N1[Odbierz wiadomość]
-        N2[Wyślij powiadomienie<br/>email/SMS/push]
+        N1[Receive message]
+        N2[Send notification<br/>email/SMS/push]
         N3[ACK]
     end
 
     subgraph AuditConsumer
-        AU[Log dla compliance]
+        AU[Log for compliance]
     end
 
     %% Main Flow
     A --> B --> C --> D --> E --> F
 
     %% Outbox to Validation
-    E -.->|co 3s| G
+    E -.->|every 3s| G
     G --> H --> I
     H --> K1
 
     %% Validation Consumer
     K1 --> V1 --> V2
-    V2 -->|Tak - skip| V7
-    V2 -->|Nie| V3 --> V4 --> V5 --> V6 --> V7 --> V8
+    V2 -->|Yes - skip| V7
+    V2 -->|No| V3 --> V4 --> V5 --> V6 --> V7 --> V8
 
     %% Outbox to Execution
-    V7 -.->|co 3s| G
+    V7 -.->|every 3s| G
     H --> K2
 
     %% Execution Consumer
     K2 --> E1 --> E2
-    E2 -->|Tak - skip| E7
-    E2 -->|Nie| E3 --> E4 --> E5 --> E6 --> E7 --> E8
+    E2 -->|Yes - skip| E7
+    E2 -->|No| E3 --> E4 --> E5 --> E6 --> E7 --> E8
 
     %% Outbox to Completed
-    E7 -.->|co 3s| G
+    E7 -.->|every 3s| G
     H --> K3
 
     %% Notification Consumer
@@ -104,22 +104,22 @@ flowchart TD
     class G,H,I outbox
 ```
 
-## Status Transfer - Maszyna stanów
+## Transfer Status - State Machine
 
 ```mermaid
 stateDiagram-v2
     [*] --> PENDING: POST /api/transfers
     PENDING --> VALIDATING: ValidationConsumer start
-    VALIDATING --> VALIDATED: Walidacja OK
-    VALIDATING --> FAILED: Błąd biznesowy → DLT
+    VALIDATING --> VALIDATED: Validation OK
+    VALIDATING --> FAILED: Business error → DLT
     VALIDATED --> EXECUTING: ExecutionConsumer start
-    EXECUTING --> COMPLETED: Transfer wykonany
-    EXECUTING --> FAILED: Błąd wykonania → DLT
+    EXECUTING --> COMPLETED: Transfer executed
+    EXECUTING --> FAILED: Execution error → DLT
     COMPLETED --> [*]
     FAILED --> [*]
 ```
 
-## Sekwencja czasowa
+## Time Sequence
 
 ```mermaid
 sequenceDiagram
@@ -139,7 +139,7 @@ sequenceDiagram
     TS->>DB: Save OutboxEvent
     TS-->>C: 201 Created + transferId
 
-    Note over OP: Co 3 sekundy
+    Note over OP: Every 3 seconds
     OP->>DB: SELECT unprocessed events
     OP->>K: Send to transfer-validation
     OP->>DB: Mark as processed
@@ -167,13 +167,13 @@ sequenceDiagram
     NC->>K: ACK
 ```
 
-## Kluczowe cechy
+## Key Features
 
-| Cecha | Implementacja |
-|-------|--------------|
-| **Atomowość** | Outbox Pattern - DB + Event w jednej transakcji |
-| **Idempotencja** | UUID transferId + sprawdzanie statusu |
+| Feature | Implementation |
+|---------|---------------|
+| **Atomicity** | Outbox Pattern - DB + Event in single transaction |
+| **Idempotency** | UUID transferId + status checks |
 | **Exactly-once** | Manual ACK + idempotency checks |
-| **Spójność danych** | Pessimistic locking (SELECT FOR UPDATE) |
-| **Kolejność** | Partycjonowanie po fromAccountNumber |
-| **Audyt** | Osobny consumer group dla audit-group |
+| **Data consistency** | Pessimistic locking (SELECT FOR UPDATE) |
+| **Ordering** | Partitioning by fromAccountNumber |
+| **Audit** | Separate consumer group for audit-group |

@@ -1,23 +1,23 @@
 # Error Handling & DLT Flow Diagram
 
-## Przepływ obsługi błędów z Dead Letter Topic
+## Error Handling Flow with Dead Letter Topic
 
 ```mermaid
 flowchart TD
     subgraph Consumer["Consumer (Validation/Execution/Notification)"]
-        C1[Odbierz wiadomość z Kafka]
-        C2[Przetwarzaj wiadomość]
-        C3{Błąd?}
-        C4[ACK - sukces]
+        C1[Receive message from Kafka]
+        C2[Process message]
+        C3{Error?}
+        C4[ACK - success]
     end
 
     subgraph ErrorHandler
         EH1[handleError]
-        EH2[Klasyfikuj błąd<br/>ErrorClassifier]
+        EH2[Classify error<br/>ErrorClassifier]
     end
 
     subgraph ErrorClassifier
-        EC1{Typ wyjątku?}
+        EC1{Exception type?}
         EC2[BUSINESS_VALIDATION<br/>maxRetries: 0]
         EC3[TECHNICAL_TRANSIENT<br/>maxRetries: 5]
         EC4[DESERIALIZATION<br/>maxRetries: 0]
@@ -25,17 +25,17 @@ flowchart TD
     end
 
     subgraph RetryLogic
-        R1{Próba < maxRetries?}
-        R2[Oblicz delay:<br/>initialDelay × 2^attempt]
+        R1{Attempt < maxRetries?}
+        R2[Calculate delay:<br/>initialDelay × 2^attempt]
         R3[Thread.sleep delay]
-        R4[NIE rób ACK<br/>Kafka ponowi]
+        R4[Do NOT ACK<br/>Kafka will redeliver]
     end
 
     subgraph DeadLetterTopicService
-        DLT1[Utwórz FailedMessage]
-        DLT2[Dodaj metadane:<br/>- originalTopic<br/>- partition/offset<br/>- exception details<br/>- stackTrace<br/>- attemptCount<br/>- errorCategory]
-        DLT3[Wyślij do topic-dlt]
-        DLT4[ACK oryginalną wiadomość]
+        DLT1[Create FailedMessage]
+        DLT2[Add metadata:<br/>- originalTopic<br/>- partition/offset<br/>- exception details<br/>- stackTrace<br/>- attemptCount<br/>- errorCategory]
+        DLT3[Send to topic-dlt]
+        DLT4[ACK original message]
     end
 
     subgraph DLT Topics
@@ -45,9 +45,9 @@ flowchart TD
     end
 
     subgraph DltMonitorConsumer
-        MON1[Konsumuj z *-dlt topics]
-        MON2[Aktualizuj statystyki]
-        MON3[Log szczegóły błędu]
+        MON1[Consume from *-dlt topics]
+        MON2[Update statistics]
+        MON3[Log error details]
     end
 
     subgraph DltStatsController
@@ -57,20 +57,20 @@ flowchart TD
 
     %% Main flow
     C1 --> C2 --> C3
-    C3 -->|Nie| C4
-    C3 -->|Tak| EH1
+    C3 -->|No| C4
+    C3 -->|Yes| EH1
 
     %% Error classification
     EH1 --> EH2 --> EC1
     EC1 -->|AccountNotFoundException<br/>InsufficientFundsException<br/>InvalidAccountException| EC2
     EC1 -->|SQLException<br/>ConnectException<br/>SocketTimeoutException| EC3
     EC1 -->|JsonParseException<br/>MessageConversionException| EC4
-    EC1 -->|Inne| EC5
+    EC1 -->|Other| EC5
 
     %% Retry decision
     EC2 & EC3 & EC4 & EC5 --> R1
-    R1 -->|Tak - retry| R2 --> R3 --> R4
-    R1 -->|Nie - max retries| DLT1
+    R1 -->|Yes - retry| R2 --> R3 --> R4
+    R1 -->|No - max retries| DLT1
 
     %% DLT flow
     DLT1 --> DLT2 --> DLT3 --> DLT4
@@ -94,7 +94,7 @@ flowchart TD
     class C4 success
 ```
 
-## Klasyfikacja błędów i strategia retry
+## Error Classification and Retry Strategy
 
 ```mermaid
 flowchart LR
@@ -118,16 +118,16 @@ flowchart LR
     end
 
     subgraph Unknown["UNKNOWN"]
-        U1[Wszystkie inne wyjątki]
+        U1[All other exceptions]
     end
 
-    BusinessValidation -->|maxRetries: 0<br/>Natychmiast do DLT| DLT[(DLT)]
+    BusinessValidation -->|maxRetries: 0<br/>Immediately to DLT| DLT[(DLT)]
     TechnicalTransient -->|maxRetries: 5<br/>Exponential backoff:<br/>1s, 2s, 4s, 8s, 16s| RETRY{Retry?}
-    RETRY -->|sukces| OK[Sukces]
+    RETRY -->|success| OK[Success]
     RETRY -->|max retries| DLT
-    Deserialization -->|maxRetries: 0<br/>Natychmiast do DLT| DLT
+    Deserialization -->|maxRetries: 0<br/>Immediately to DLT| DLT
     Unknown -->|maxRetries: 1<br/>500ms delay| RETRY2{Retry?}
-    RETRY2 -->|sukces| OK
+    RETRY2 -->|success| OK
     RETRY2 -->|max retries| DLT
 
     classDef business fill:#ffa94d,stroke:#e8590c
@@ -143,11 +143,11 @@ flowchart LR
     class DLT dlt
 ```
 
-## Exponential Backoff - szczegóły
+## Exponential Backoff - Details
 
 ```mermaid
 flowchart TD
-    START[Błąd TECHNICAL_TRANSIENT] --> A1[Attempt 1]
+    START[TECHNICAL_TRANSIENT error] --> A1[Attempt 1]
     A1 -->|Fail| W1[Wait 1s]
     W1 --> A2[Attempt 2]
     A2 -->|Fail| W2[Wait 2s]
@@ -157,16 +157,16 @@ flowchart TD
     A4 -->|Fail| W4[Wait 8s]
     W4 --> A5[Attempt 5]
     A5 -->|Fail| W5[Wait 16s]
-    W5 --> A6[Attempt 6 - ostatnia]
+    W5 --> A6[Attempt 6 - final]
     A6 -->|Fail| DLT[Send to DLT]
 
-    A1 & A2 & A3 & A4 & A5 & A6 -->|Success| OK[Sukces - ACK]
+    A1 & A2 & A3 & A4 & A5 & A6 -->|Success| OK[Success - ACK]
 
     style DLT fill:#ff6b6b,stroke:#c92a2a,color:#fff
     style OK fill:#69db7c,stroke:#2f9e44,color:#fff
 ```
 
-## Struktura FailedMessage w DLT
+## FailedMessage Structure in DLT
 
 ```mermaid
 classDiagram
@@ -201,7 +201,7 @@ classDiagram
     FailedMessage --> ErrorCategory
 ```
 
-## Sekwencja obsługi błędu
+## Error Handling Sequence
 
 ```mermaid
 sequenceDiagram
@@ -213,39 +213,39 @@ sequenceDiagram
     participant KDLT as Kafka DLT
     participant MON as DltMonitorConsumer
 
-    K->>C: Wiadomość
-    C->>C: Przetwarzaj
-    C->>C: ❌ Wyjątek!
+    K->>C: Message
+    C->>C: Process
+    C->>C: ❌ Exception!
 
     C->>EH: handleError(exception, record)
     EH->>EC: classify(exception)
     EC-->>EH: BUSINESS_VALIDATION (maxRetries=0)
 
-    Note over EH: attemptCount >= maxRetries<br/>Nie ma sensu retry
+    Note over EH: attemptCount >= maxRetries<br/>No point in retrying
 
     EH->>DLT: sendToDeadLetterTopic(record, exception)
-    DLT->>DLT: Utwórz FailedMessage
-    DLT->>KDLT: Wyślij do transfer-validation-dlt
+    DLT->>DLT: Create FailedMessage
+    DLT->>KDLT: Send to transfer-validation-dlt
     DLT-->>EH: OK
 
     EH->>C: shouldAck = true
     C->>K: ACK (offset committed)
 
-    Note over K: Wiadomość usunięta z głównego topic<br/>Zapisana w DLT do analizy
+    Note over K: Message removed from main topic<br/>Stored in DLT for analysis
 
-    KDLT->>MON: Konsumuj z DLT
-    MON->>MON: Aktualizuj statystyki
-    MON->>MON: Log szczegóły błędu
+    KDLT->>MON: Consume from DLT
+    MON->>MON: Update statistics
+    MON->>MON: Log error details
 ```
 
-## Monitorowanie DLT - REST API
+## DLT Monitoring - REST API
 
-| Endpoint | Opis | Odpowiedź |
-|----------|------|-----------|
-| `GET /api/dlt/stats` | Statystyki DLT | `{totalSentToDlt, byTopic, byCategory}` |
+| Endpoint | Description | Response |
+|----------|-------------|----------|
+| `GET /api/dlt/stats` | DLT statistics | `{totalSentToDlt, byTopic, byCategory}` |
 | `GET /api/dlt/health` | Health check | `{status, totalDltMessages, threshold}` |
 
-### Przykład odpowiedzi `/api/dlt/stats`:
+### Example response `/api/dlt/stats`:
 
 ```json
 {
@@ -261,12 +261,12 @@ sequenceDiagram
 }
 ```
 
-## Kluczowe zasady DLT
+## Key DLT Principles
 
-| Zasada | Opis |
-|--------|------|
-| **Nie blokuj partycji** | Błędne wiadomości trafiają do DLT, nie blokują kolejki |
-| **Zachowaj kontekst** | FailedMessage zawiera wszystkie informacje do debugowania |
-| **Retencja 30 dni** | DLT topics mają dłuższą retencję niż główne |
-| **Monitorowanie** | Alerting gdy >100 wiadomości w DLT |
-| **Separacja kategorii** | Różne strategie dla różnych typów błędów |
+| Principle | Description |
+|-----------|-------------|
+| **Don't block partition** | Failed messages go to DLT, don't block the queue |
+| **Preserve context** | FailedMessage contains all info for debugging |
+| **30-day retention** | DLT topics have longer retention than main topics |
+| **Monitoring** | Alert when >100 messages in DLT |
+| **Category separation** | Different strategies for different error types |
