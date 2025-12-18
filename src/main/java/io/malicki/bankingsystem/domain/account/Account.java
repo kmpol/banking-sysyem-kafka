@@ -48,10 +48,7 @@ public class Account {
     // Business methods
     public void withdraw(BigDecimal amount) {
         if (balance.compareTo(amount) < 0) {
-            throw new InsufficientFundsException(
-                "Insufficient funds in account " + accountNumber + 
-                ". Available: " + balance + ", Required: " + amount
-            );
+            throw new InsufficientFundsException(accountNumber, balance, amount);
         }
         this.balance = this.balance.subtract(amount);
     }

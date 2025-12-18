@@ -1,6 +1,7 @@
 package io.malicki.bankingsystem.kafka.config;
 
 import io.malicki.bankingsystem.domain.transfer.TransferEvent;
+import io.malicki.bankingsystem.kafka.errorhandling.FailedMessage;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.springframework.context.annotation.Bean;
@@ -42,6 +43,36 @@ public class KafkaConsumerConfig {
         // MANUAL ACK MODE (for exactly-once)
         factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
         
+        return factory;
+    }
+
+    // W KafkaConsumerConfig.java - DODAJ na końcu:
+
+    @Bean
+    public ConsumerFactory<String, FailedMessage> dltConsumerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        config.put(ConsumerConfig.GROUP_ID_CONFIG, "dlt-monitor");
+        config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        config.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        config.put(JsonDeserializer.VALUE_DEFAULT_TYPE, FailedMessage.class.getName());
+
+        return new DefaultKafkaConsumerFactory<>(
+                config,
+                new StringDeserializer(),
+                new JsonDeserializer<>(FailedMessage.class, false)
+        );
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, FailedMessage> dltKafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, FailedMessage> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(dltConsumerFactory());
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
         return factory;
     }
 }

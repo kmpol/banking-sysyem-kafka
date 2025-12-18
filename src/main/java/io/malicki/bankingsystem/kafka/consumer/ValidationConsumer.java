@@ -8,175 +8,183 @@ import io.malicki.bankingsystem.domain.transfer.TransferRepository;
 import io.malicki.bankingsystem.domain.transfer.TransferStatus;
 import io.malicki.bankingsystem.exception.AccountNotFoundException;
 import io.malicki.bankingsystem.exception.InsufficientFundsException;
+import io.malicki.bankingsystem.exception.InvalidAccountException;
+import io.malicki.bankingsystem.kafka.errorhandling.ErrorHandler;
 import io.malicki.bankingsystem.kafka.outbox.OutboxService;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
-import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
-import static io.malicki.bankingsystem.kafka.config.KafkaTopicsConfig.TRANSFER_EXECUTION_TOPIC;
-import static io.malicki.bankingsystem.kafka.config.KafkaTopicsConfig.TRANSFER_VALIDATION_TOPIC;
+import java.math.BigDecimal;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
-@Service
+@Component
 @Slf4j
 public class ValidationConsumer {
-    
+
     private final TransferRepository transferRepository;
     private final AccountRepository accountRepository;
     private final OutboxService outboxService;
-    
+    private final ErrorHandler errorHandler;
+
+    // Track retry attempts per offset
+    private final Map<Long, Integer> retryAttempts = new ConcurrentHashMap<>();
+
     public ValidationConsumer(
-        TransferRepository transferRepository,
-        AccountRepository accountRepository,
-        OutboxService outboxService
+            TransferRepository transferRepository,
+            AccountRepository accountRepository,
+            OutboxService outboxService,
+            ErrorHandler errorHandler
     ) {
         this.transferRepository = transferRepository;
         this.accountRepository = accountRepository;
         this.outboxService = outboxService;
+        this.errorHandler = errorHandler;
     }
-    
+
     @KafkaListener(
-        topics = TRANSFER_VALIDATION_TOPIC,
-        groupId = "banking-system",
-        containerFactory = "kafkaListenerContainerFactory"
+            topics = "transfer-validation",
+            groupId = "banking-system",
+            containerFactory = "kafkaListenerContainerFactory"
     )
     @Transactional
-    public void validateTransfer(
-        ConsumerRecord<String, TransferEvent> record,
-        Acknowledgment ack
-    ) {
+    public void consume(ConsumerRecord<String, TransferEvent> record, Acknowledgment ack) {
         TransferEvent event = record.value();
         String transferId = event.getTransferId();
-        
-        log.info("🔍 [VALIDATION] Processing transfer: {} | Partition: {} | Offset: {}", 
-                transferId, record.partition(), record.offset());
-        
+
+        // Get current attempt count for this offset
+        int currentAttempt = retryAttempts.getOrDefault(record.offset(), 0);
+
+        log.info("🔍 [VALIDATION] Processing transfer: {} | Partition: {} | Offset: {} | Attempt: {}",
+                transferId,
+                record.partition(),
+                record.offset(),
+                currentAttempt + 1);
+
         try {
-            // 1. Find transfer in DB
+            // Find transfer
             Transfer transfer = transferRepository.findByTransferId(transferId)
-                .orElseThrow(() -> new RuntimeException("Transfer not found: " + transferId));
-            
-            // 2. Idempotency check
-            if (transfer.getStatus() == TransferStatus.VALIDATED) {
-                log.info("⚠️  Transfer {} already VALIDATED, re-sending to outbox", transferId);
-                
-                // Re-save to outbox (idempotent - will be sent again)
+                    .orElseThrow(() -> new RuntimeException("Transfer not found: " + transferId));
+
+            // Idempotency check
+            if (transfer.getStatus() == TransferStatus.VALIDATED ||
+                    transfer.getStatus() == TransferStatus.EXECUTING ||
+                    transfer.getStatus() == TransferStatus.COMPLETED) {
+
+                log.info("⚠️  Transfer {} already {}, re-sending to outbox",
+                        transferId, transfer.getStatus());
+
                 TransferEvent validatedEvent = TransferEvent.from(transfer);
                 outboxService.saveOutboxEvent(
+                        transfer.getTransferId(),
+                        "TransferValidated",
+                        "transfer-execution",
+                        transfer.getFromAccountNumber(),
+                        validatedEvent
+                );
+
+                ack.acknowledge();
+                retryAttempts.remove(record.offset()); // Clean up
+                return;
+            }
+
+            // Update status
+            transfer.setStatus(TransferStatus.VALIDATING);
+            transferRepository.save(transfer);
+
+            // Validate business rules
+            log.debug("Validating business rules for transfer: {}", transferId);
+            validateBusinessRules(transfer);
+
+            // Mark as validated
+            transfer.setStatus(TransferStatus.VALIDATED);
+            transferRepository.save(transfer);
+
+            // Save to outbox
+            TransferEvent validatedEvent = TransferEvent.from(transfer);
+            outboxService.saveOutboxEvent(
                     transfer.getTransferId(),
                     "TransferValidated",
                     "transfer-execution",
                     transfer.getFromAccountNumber(),
                     validatedEvent
-                );
-                
-                ack.acknowledge();
-                return;
-            }
-            
-            if (transfer.getStatus() == TransferStatus.COMPLETED || 
-                transfer.getStatus() == TransferStatus.FAILED) {
-                log.info("⚠️  Transfer {} already {}, skipping", transferId, transfer.getStatus());
-                ack.acknowledge();
-                return;
-            }
-            
-            // 3. Update status to VALIDATING
-            transfer.setStatus(TransferStatus.VALIDATING);
-            transferRepository.save(transfer);
-            
-            // 4. BUSINESS VALIDATIONS
-            validateBusinessRules(transfer);
-            
-            // 5. Mark as VALIDATED
-            transfer.setStatus(TransferStatus.VALIDATED);
-            transferRepository.save(transfer);
-            
-            // 6. SAVE TO OUTBOX (same transaction)
-            TransferEvent validatedEvent = TransferEvent.from(transfer);
-            outboxService.saveOutboxEvent(
-                transfer.getTransferId(),
-                "TransferValidated",
-                TRANSFER_EXECUTION_TOPIC,
-                transfer.getFromAccountNumber(),  // routing key
-                validatedEvent
             );
-            
+
             log.info("✅ [VALIDATION] Transfer validated + saved to outbox: {}", transferId);
-            
-            // 7. Commit offset (safe now - event in outbox!)
+
+            // Acknowledge and clean up retry tracking
             ack.acknowledge();
-        } catch (AccountNotFoundException | InsufficientFundsException e) {
-            // Business error - don't retry, mark as FAILED
-            log.error("❌ [VALIDATION] Business error: {}", e.getMessage());
-            handleBusinessError(transferId, e, ack);
-            
+            retryAttempts.remove(record.offset());
+
         } catch (Exception e) {
-            // Technical error - don't ack, will retry
-            log.error("❌ [VALIDATION] Technical error: {}", e.getMessage(), e);
-            // Don't ack - Kafka will retry
-            // But if retries exceeded, should go to DLT (configure in error handler)
+            log.error("❌ [VALIDATION] Error processing transfer {}: {}",
+                    transferId, e.getMessage());
+
+            // Increment retry attempt
+            retryAttempts.put(record.offset(), currentAttempt + 1);
+
+            // Delegate to ErrorHandler
+            errorHandler.handleError(
+                    record,
+                    e,
+                    ack,
+                    "banking-system",
+                    currentAttempt
+            );
         }
     }
-    
+
     private void validateBusinessRules(Transfer transfer) {
-        log.debug("Validating business rules for transfer: {}", transfer.getTransferId());
-        
-        // 1. Check FROM account exists and is active
+        // 1. Check if accounts exist
         Account fromAccount = accountRepository.findByAccountNumber(transfer.getFromAccountNumber())
-            .orElseThrow(() -> new AccountNotFoundException(
-                "Account not found: " + transfer.getFromAccountNumber()
-            ));
-        
-        if (!fromAccount.isActive()) {
-            throw new IllegalStateException("Account is not active: " + fromAccount.getAccountNumber());
-        }
-        
-        // 2. Check TO account exists and is active
+                .orElseThrow(() -> new AccountNotFoundException(transfer.getFromAccountNumber()));
+
         Account toAccount = accountRepository.findByAccountNumber(transfer.getToAccountNumber())
-            .orElseThrow(() -> new AccountNotFoundException(
-                "Account not found: " + transfer.getToAccountNumber()
-            ));
-        
+                .orElseThrow(() -> new AccountNotFoundException(transfer.getToAccountNumber()));
+
+        // 2. Check if accounts are active
+        if (!fromAccount.isActive()) {
+            throw new InvalidAccountException(
+                    fromAccount.getAccountNumber(),
+                    "Account is not active"
+            );
+        }
+
         if (!toAccount.isActive()) {
-            throw new IllegalStateException("Account is not active: " + toAccount.getAccountNumber());
+            throw new InvalidAccountException(
+                    toAccount.getAccountNumber(),
+                    "Account is not active"
+            );
         }
-        
-        // 3. Check same account
-        if (fromAccount.getAccountNumber().equals(toAccount.getAccountNumber())) {
-            throw new IllegalArgumentException("Cannot transfer to the same account");
-        }
-        
-        // 4. Check sufficient funds
+
+        // 3. Check if sufficient funds
         if (fromAccount.getBalance().compareTo(transfer.getAmount()) < 0) {
             throw new InsufficientFundsException(
-                "Insufficient funds in account " + fromAccount.getAccountNumber() +
-                ". Available: " + fromAccount.getBalance() +
-                ", Required: " + transfer.getAmount()
+                    fromAccount.getAccountNumber(),
+                    fromAccount.getBalance(),
+                    transfer.getAmount()
             );
         }
-        
-        log.debug("✅ Business rules validated successfully");
-    }
-    
-    @Transactional
-    private void handleBusinessError(String transferId, Exception e, Acknowledgment ack) {
-        try {
-            Transfer transfer = transferRepository.findByTransferId(transferId)
-                .orElseThrow(() -> new RuntimeException("Transfer not found"));
-            
-            transfer.setStatus(TransferStatus.FAILED);
-            transfer.setFailureReason(e.getMessage());
-            transferRepository.save(transfer);
-            
-            log.warn("Transfer {} marked as FAILED: {}", transferId, e.getMessage());
-            
-        } catch (Exception ex) {
-            log.error("Failed to handle business error: {}", ex.getMessage());
-        } finally {
-            ack.acknowledge();  // Always commit - don't retry business errors
+
+        // 4. Check if not same account
+        if (fromAccount.getAccountNumber().equals(toAccount.getAccountNumber())) {
+            throw new InvalidAccountException(
+                    fromAccount.getAccountNumber(),
+                    "Cannot transfer to the same account"
+            );
         }
+
+        // 5. Check if amount is positive
+        if (transfer.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException(
+                    "Transfer amount must be positive: " + transfer.getAmount()
+            );
+        }
+
+        log.debug("✅ Business rules validated for transfer: {}", transfer.getTransferId());
     }
 }

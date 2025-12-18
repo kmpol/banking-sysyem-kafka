@@ -49,7 +49,6 @@ public class TransferService {
         Transfer saved = transferRepository.save(transfer);
         log.info("✅ Transfer saved to DB: {}", transferId);
 
-        // ⭐ Save to OUTBOX (in same transaction!) ⭐
         TransferEvent event = TransferEvent.from(saved);
         outboxService.saveOutboxEvent(
                 saved.getTransferId(),
