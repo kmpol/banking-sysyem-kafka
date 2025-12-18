@@ -1,5 +1,25 @@
 # Banking System - Transfer Flow
 
+## What is this project?
+A production-ready banking system built with Apache Kafka that demonstrates advanced distributed systems patterns including:
+
+- Exactly-once semantics for financial transactions
+- Outbox Pattern for atomic database + Kafka operations
+- Dead Letter Topics (DLT) with error handling
+- Idempotent operations to handle message duplicates
+- Multi-stage processing (validation → execution → notification)
+- Event-driven architecture with multiple consumer groups
+
+Use Case
+The system handles money transfers between bank accounts with:
+
+- Account validation (exists, active, sufficient funds)
+- Balance checking and business rule validation
+- Atomic fund transfers with pessimistic locking
+- Event-driven notifications
+- Comprehensive audit logging
+- Resilient error handling with DLT
+
 ## Sequence Diagram
 ```mermaid
 sequenceDiagram
